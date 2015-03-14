@@ -20,6 +20,8 @@ import bgl
 import blf
 import bmesh
 import math
+import random
+from collections import Counter
 from mathutils import Matrix, Vector
 import numpy as np 
 from bpy_extras import view3d_utils
@@ -34,21 +36,24 @@ class CuspWaterDroplet(object):
         self.up_vert = bmvert
         self.dn_vert = bmvert
         self.ind_path = [bmvert.index]
-        self.curv_id = curv_ud
+        self.curv_id = curv_id
         self.settled = False
         self.peaked = False
+        
+        
+        self.pln_no = pln_no
+        self.pln_pt = pln_pt
+        self.alpha = 0.5  #good values 0.4 to 0.6
+        
         self.upH = self.hfunc(bmvert)
         self.dnH = self.hfunc(bmvert)
-        
-        
-        self.alpha = 0.5  #good values 0.4 to 0.6
         
     def hfunc(self,bvert):
         
         #possible to cache hfunc over whole mesh?
-        vz = pln_no.dot(v.co - pln_pt)
-        K = bmvert.layers.float[self.curv_id]
-        H = (1 - self.alpha) * K + self.alpha * vz
+        vz = self.pln_no.dot(bvert.co - self.pln_pt)
+        K = bvert[self.curv_id]  #curvatures are precalced and saved in ID layer
+        H = (1 - self.alpha) * K - self.alpha * vz  #perhaps height and curvature need to be normalized somehow?
         
         return H
     def roll_downhill(self):
@@ -56,12 +61,15 @@ class CuspWaterDroplet(object):
         vs = vert_neighbors(self.dn_vert)
         Hs = [self.hfunc(v) for v in vs]
         
-        if self.H < min(Hs):
+        if self.dnH < min(Hs):
             self.settled = True
-            
+            return
+        
         else:
-            self.dn_vert = vs[Hs.index(min(Hs))]
-            self.ind_path.append(self.vert.index)
+            V = vs[Hs.index(min(Hs))]
+            self.dn_vert = V
+            self.ind_path.append(self.dn_vert.index)
+            self.dnH = min(Hs)
             
     def roll_uphill(self):
         
@@ -70,10 +78,13 @@ class CuspWaterDroplet(object):
         
         if self.upH > max(Hs):
             self.peaked = True
-            
+            return
+        
         else:
-            self.up_vert = vs[Hs.index(max(Hs))]
-            self.ind_path.insert(0, self.vert.index)        
+            V = vs[Hs.index(max(Hs))]            
+            self.up_vert = V
+            self.ind_path.insert(0, self.up_vert.index)        
+            self.upH = max(Hs)
             
 def walk_from_vert(vert, prev_vert, steps, scalar_id, dir = None):
     '''
@@ -730,13 +741,163 @@ class ViewObjectSalience(bpy.types.Operator):
             return {'CANCELLED'}
         else:
             return {'PASS_THROUGH'}
+
+
+class WatershedObjectCurvature(bpy.types.Operator):
+    """Roll Water Drops to find Cusps"""
+    bl_idname = "view3d.watershed_cusp_finder"
+    bl_label = "Find Cusps"
+
+    
+    def draw_callback_water_drops(self, context):
         
+        mx = context.object.matrix_world
+        
+        if not self.consensus_generated:
+            for droplet in self.drops:
+                vs = [mx * self.bme.verts[i].co for i in droplet.ind_path]
+            
+                #draw_3d_points(context, vs, (.2,.3,.8,1), 2)
+                draw_3d_points(context, [vs[-1]], (1,.3,.3,1), 3)
+                #draw_3d_points(context, [vs[0]], (.3,1,.3,1), 4)
+        
+        if self.consensus_generated:
+            
+            vs = [mx * self.bme.verts[i].co for i in self.concensus_list]
+            draw_3d_points(context, vs, (.2,.8,.8,1), 5)
+            
+        if self.sorted_by_value:
+            vs = [mx * self.bme.verts[i].co for i in self.best_verts]
+            draw_3d_points(context, vs, (.8,.8,.2,1), 3)
+                  
+    def roll_droplets(self,context):
+        count_up = 0
+        count_dn = 0
+        for drop in self.drops:
+            #if not drop.peaked:
+            #    drop.roll_uphill()
+            #    count_up += 1
+            if not drop.settled:
+                drop.roll_downhill()
+                count_dn += 1
+
+    def build_concensu(self,context):
+        
+        list_inds = [drop.dn_vert.index for drop in self.drops]
+        vals = [drop.dnH for drop in self.drops]
+        
+        
+        unique = set(list_inds)
+        unique_vals = [vals[list_inds.index(ind)] for ind in unique]
+        
+        
+        print('there are %i droplets' %len(list_inds))
+        print('ther are %i unique maxima' % len(unique))
+    
+        best = Counter(list_inds)
+        
+        consensus_tupples = best.most_common(self.concensus_count)
+        self.concensus_list = [tup[0] for tup in consensus_tupples]
+        
+        #print(self.concensus_list)
+        self.consensus_generated = True
+        
+    
+    def sort_by_value(self,context):
+        
+        list_inds = [drop.dn_vert.index for drop in self.drops]
+        vals = [drop.dnH for drop in self.drops]
+        
+        
+        unique_inds = list(set(list_inds))
+        unique_vals = [vals[list_inds.index(ind)] for ind in unique_inds]
+        
+        bme_inds_by_val = [i for (v,i) in sorted(zip(unique_vals, unique_inds))]
+        self.best_verts = bme_inds_by_val[0:self.concensus_count]
+        self.sorted_by_value = True
+            
+    def invoke(self,context, event):
+        ob = bpy.context.object
+        self.bme = bmesh.new()
+        self.bme.from_mesh(ob.data)
+
+        self.bme.verts.ensure_lookup_table()
+        self.bme.faces.ensure_lookup_table()
+        
+        curv_id = self.bme.verts.layers.float['max_curve']
+        
+        rand_sample = list(set([random.randint(0,len(self.bme.verts)-1) for i in range(math.floor(.2 * len(self.bme.verts)))]))
+        
+        sel_verts = [self.bme.verts[i] for i in rand_sample]
+        pln_pt = Vector((0,0,0))  #TODO calc centroid of high curvature
+        pln_no = Vector((0,0,1))  #TODO....calc this from PCA analysis of clustered curvature
+        self.drops = [CuspWaterDroplet(v, pln_pt, pln_no, curv_id) for v in sel_verts if v.co[2] > 0]
+        
+        self.concensus_count = 80
+        self.concensus_list = []
+        self.consensus_generated = False
+        
+        self.best_verts = []
+        self.sorted_by_value = False
+        
+        self._handle = bpy.types.SpaceView3D.draw_handler_add(self.draw_callback_water_drops, (context,), 'WINDOW', 'POST_PIXEL')
+        context.window_manager.modal_handler_add(self)
+    
+        return {'RUNNING_MODAL'}
+    
+    def modal(self,context,event):
+        context.area.tag_redraw()
+        
+        if event.type == 'RET' and event.value == 'PRESS':
+            for drop in self.drops:
+                for i in drop.ind_path:
+                    self.bme.verts[i].select = True
+            
+            bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            self.bme.to_mesh(context.object.data)
+            self.bme.free()
+            
+            return {'FINISHED'}
+          
+        elif event.type == 'UP_ARROW' and event.value == 'PRESS':
+            self.roll_droplets(context)
+            return {'RUNNING_MODAL'}
+        
+        
+        elif event.type == 'LEFT_ARROW' and event.value == 'PRESS':
+            self.concensus_count -= 5
+            self.build_concensu(context)
+            return {'RUNNING_MODAL'}
+        
+        elif event.type == 'RIGHT_ARROW' and event.value == 'PRESS':
+            self.concensus_count += 5
+            self.build_concensu(context)
+            return {'RUNNING_MODAL'}
+        
+        elif event.type == 'B' and event.value == 'PRESS':
+            self.build_concensu(context) 
+            return {'RUNNING_MODAL'}
+        
+        elif event.type == 'S' and event.value == 'PRESS':
+            self.sort_by_value(context)
+            return {'RUNNING_MODAL'}
+                   
+        elif event.type in {'RIGHTMOUSE', 'ESC'}:
+            bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            self.bme.to_mesh(context.object.data)
+            self.bme.free()
+            return {'CANCELLED'}
+        else:
+            return {'PASS_THROUGH'}        
 def register():
     bpy.utils.register_class(ViewOperatorObjectCurve)
     bpy.utils.register_class(ViewObjectSalience)
+    bpy.utils.register_class(WatershedObjectCurvature)
+    
 def unregister():
     bpy.utils.unregister_class(ViewOperatorObjectCurve)
     bpy.utils.unregister_class(ViewObjectSalience)
+    bpy.utils.unregister_class(WatershedObjectCurvature)
     
 
 if __name__ == "__main__":
