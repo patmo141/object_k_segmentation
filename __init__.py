@@ -30,7 +30,7 @@ from bpy_extras.view3d_utils import location_3d_to_region_2d, region_2d_to_vecto
 
 from retopoflow.polystrips_utilities import cubic_bezier_fit_points, cubic_bezier_blend_t
 
-def bbox(verts):
+def bbox(bme_verts):
     '''
     takes a lsit of BMverts ora  list of vectors
     '''
@@ -81,8 +81,8 @@ def points_within_radius(pt, locs, R):
                 
     ds.sort()
     inds = [dist_inds[D] for D in ds]
-    
-    return (ds, inds)
+    vs = [locs[i] for i in inds]
+    return (ds, inds, vs)
     
     
     
@@ -525,7 +525,21 @@ def draw_3d_points(context, points, color, size):
     bgl.glEnd()   
     return
 
+def draw_3d_text(context, pt, msg, size):
+    '''
+    draw text at a given pt
+    '''
+    point_2d = location_3d_to_region_2d(context.region, context.space_data.region_3d, pt)
 
+    bgl.glColor4f(0.9, 0.9, 0.9, 0.8)
+    font_id = 0  # XXX, need to find out how best to get this.
+
+    # draw some text
+    blf.position(font_id, point_2d[0], point_2d[1], 0)
+    blf.size(font_id, size, 72)
+    blf.draw(font_id, msg)
+    
+    return
 
 
 class ViewOperatorObjectCurve(bpy.types.Operator):
@@ -945,10 +959,13 @@ class WatershedObjectCurvature(bpy.types.Operator):
             
         if len(self.bez_curve):
             vs = [mx * v for v in self.bez_curve]
-            draw_3d_points(context, vs, (.2,1,.2,1), 3)
-        
+            draw_polyline_from_3dpoints(context, vs, (.2,1,.2,1), 3)
         if len(self.polyline):
-            draw_polyline_from_3dpoints(context, self.polyline, (1,1,.2,1), 2)
+            #draw_polyline_from_3dpoints(context, self.polyline, (1,1,.2,1), 2)
+            
+            for i, v in enumerate(self.polyline):
+                msg = str(i)
+                draw_3d_text(context, v, msg, 20)
                          
     def roll_droplets(self,context):
         count_up = 0
@@ -960,6 +977,8 @@ class WatershedObjectCurvature(bpy.types.Operator):
             if not drop.settled:
                 drop.roll_downhill()
                 count_dn += 1
+                
+        return count_dn
 
     def build_concensu(self,context):
         
@@ -1006,20 +1025,32 @@ class WatershedObjectCurvature(bpy.types.Operator):
         #consensus list is sorted with most voted for locations first
         #start at back of list and work forward
         to_remove = []
+        new_verts = []
         l_co = [self.bme.verts[i].co for i in self.consensus_list]
         N = len(l_co)
         for i, pt in enumerate(l_co):
             
-            if i in to_remove:
-                continue
+            #if i in to_remove:
+            #    continue
             
-            ds, inds = points_within_radius(pt, l_co, 2.5)
+            ds, inds, vs = points_within_radius(pt, l_co, 7)
             
+            if len(vs):
+                new_co = Vector((0,0,0))
+                for v in vs:
+                    new_co += v
+                new_co += pt
+                new_co *= 1/(len(vs) + 1)
+            else:
+                new_co = pt
+                
+            new_verts.append(new_co)
+                        
             for j in inds:
                 if j > i:
-                    to_remove.append(j)
+                    to_remove.append(j)  
+               
             
-                
         to_remove = list(set(to_remove))
         to_remove.sort(reverse = True)
         
@@ -1030,7 +1061,7 @@ class WatershedObjectCurvature(bpy.types.Operator):
             
         
         
-        self.clipped_verts = l_co
+        self.clipped_verts = new_verts
         
         return
         
@@ -1040,77 +1071,69 @@ class WatershedObjectCurvature(bpy.types.Operator):
         let j's be arbitrary list comprehension indices
         let n's be the incidices in our consensus point lists range 0,len(consensus_list)
         '''
-        bvs = [self.bme.verts[i] for i in self.consensus_list]  #<- consensus list holds bmesh indices
-        l_co = [self.bme.verts[i].co for i in self.consensus_list]
+        l_co = self.clipped_verts
         
         
         com, no = calculate_plane(l_co)  #an easy way to estimate occlusal plane
         no.normalize()
         
         
-        neigbors = set(l_co)
+        #neigbors = set(l_co)
         box = bbox(l_co)
         
         diag = (box[1]-box[0])**2 + (box[3]-box[2])**2 + (box[5]-box[4])**2
         diag = math.pow(diag,.5)
         
-        neighbor_path = [neighbors.pop()]
+        #neighbor_path = [neighbors.pop()]
         
         #establish a direction
-        n, v, d  = closest_point(neighbor_path[0], list(neighbors))
-        if d < .2 * diag:
-            neighbor_path.append(v)
+        #n, v, d  = closest_point(neighbor_path[0], list(neighbors))
+        #if d < .2 * diag:
+        #    neighbor_path.append(v)
         
-        ended = Fase
+        #ended = Fase
         #while len(neighbors) and not ended:   
         #   n, v, d  = closest_point(neighbor_path[0], list(neighbors)
-        
-        
-        
-        
         
         #flattened spokes
         rs = [v - v.dot(no)*v - com for v in l_co]
         
-        R0 = rs[0]
+        R0 = rs[random.randint(0,len(rs)-1)]
         
         theta_dict = {}
         thetas = []
         for r, v in zip(rs,l_co):
-            angle = math.fmod(r.angle(R0) + 4*math.pi, 2*math.pi)
-            theta_dict[angle] = v
-            thetas.append(angle)
+            angle = r.angle(R0)
+            
+            if r != R0:
+                rno = r.cross(R0)
+                if rno.dot(no) < 0:
+                    angle *= -1
+                    angle += 2 * math.pi
+            
+            theta_dict[round(angle,4)] = v
+            thetas.append(round(angle,4))
         
+        print(thetas)
         thetas.sort()
         print(thetas)
         diffs = [thetas[i]-thetas[i-1] for i in range(0,len(thetas))]
-        #n = diffs.index(max(diffs)) - 1
-        #theta_shift = thetas[n:] + thetas[:n]
+        n = diffs.index(max(diffs)) # -1
+        theta_shift = thetas[n:] + thetas[:n]
         
-        self.polyline = [theta_dict[theta] for theta in thetas]
+        self.polyline = [theta_dict[theta] for theta in theta_shift]
         #inds_in_order = [theta_dict[theta] for theta in thetas]
         #self.polyline = [l_co[i] for i in inds_in_order]
         
         self.com = com
-        
-        '''
-        geom = bmesh.ops.convex_hull(self.bme, input = bvs)
-        qhull = geom['geom']
 
-        verts = [v for v in qhull if str(type(v)) == "<class 'BMVert'>"]
-        eds = [v for v in qhull if str(type(v)) == "<class 'BMEdge'>"]
-        faces = [v for v in qhull if str(type(v)) == "<class 'BMFace>"]
-        
-        
-        l_bpts = cubic_bezier_fit_points(l_co, 3, depth=0, t0=0, t3=1, allow_split=False, force_split=False)
+        l_bpts = cubic_bezier_fit_points(self.polyline, 4, depth=0, t0=0, t3=1, allow_split=True, force_split=True)
         self.bez_curve = []
         for i,bpts in enumerate(l_bpts):
             t0,t3,p0,p1,p2, p3 = bpts
             
-            new_pts = [cubic_bezier_blend_t(p0,p1,p2,p3,i/10) for i in range(10+1)]
+            new_pts = [cubic_bezier_blend_t(p0,p1,p2,p3,i/15) for i in range(15+1)]
             self.bez_curve.extend(new_pts)  
-            
-        '''
              
     def invoke(self,context, event):
         ob = bpy.context.object
@@ -1122,7 +1145,7 @@ class WatershedObjectCurvature(bpy.types.Operator):
         
         curv_id = self.bme.verts.layers.float['max_curve']
         
-        rand_sample = list(set([random.randint(0,len(self.bme.verts)-1) for i in range(math.floor(.3 * len(self.bme.verts)))]))
+        rand_sample = list(set([random.randint(0,len(self.bme.verts)-1) for i in range(math.floor(.1 * len(self.bme.verts)))]))
         
         sel_verts = [self.bme.verts[i] for i in rand_sample]
         pln_pt = Vector((0,0,0))  #TODO calc centroid of high curvature
@@ -1161,7 +1184,12 @@ class WatershedObjectCurvature(bpy.types.Operator):
             return {'FINISHED'}
           
         elif event.type == 'UP_ARROW' and event.value == 'PRESS':
-            self.roll_droplets(context)
+            n_rolling = self.roll_droplets(context)
+            
+            iters = 0
+            while n_rolling > 10 and iters < 100:
+                n_rolling = self.roll_droplets(context)
+                iters += 1
             return {'RUNNING_MODAL'}
         
         
