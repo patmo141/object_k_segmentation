@@ -28,6 +28,138 @@ from bpy_extras import view3d_utils
 from bpy.props import BoolProperty, FloatProperty, IntProperty
 from bpy_extras.view3d_utils import location_3d_to_region_2d, region_2d_to_vector_3d, region_2d_to_location_3d, region_2d_to_origin_3d
 
+from retopoflow.polystrips_utilities import cubic_bezier_fit_points, cubic_bezier_blend_t
+
+def bbox(verts):
+    '''
+    takes a lsit of BMverts ora  list of vectors
+    '''
+    if hasattr(bme_verts[0], 'co'):
+        verts = [v.co for v in bme_verts]
+    else:
+        verts = [v for v in bme_verts]
+        
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    zs = [v[2] for v in verts]
+    
+    return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+
+def closest_point(pt, locs):
+    ds = [(loc - pt).length for loc in locs]
+    
+    best = ds.index(min(ds))
+    
+    return (best, locs[best], ds[best])
+
+
+def closest_point_in_list(pt, locs):
+    '''
+    the test point is included in the list
+    '''
+    ds = [(loc - pt).length for loc in locs if pt != loc]
+    
+    best = ds.index(min(ds))
+    
+    return (best, locs[best], ds[best])
+
+
+def points_within_radius(pt, locs, R):
+    '''
+    the test point is included in the list
+    '''
+    dist_inds = {}
+    ds = []
+    
+    for i, loc in enumerate(locs):
+        if pt != loc:
+            D = (loc -pt).length
+            dist_inds[D] = i
+            
+            if D < R:
+                ds.append(D)
+                
+    ds.sort()
+    inds = [dist_inds[D] for D in ds]
+    
+    return (ds, inds)
+    
+    
+    
+    
+    
+    best = ds.index(min(ds))
+    
+    return (best, locs[best], ds[best])
+
+
+def calculate_plane(locs, itermax = 500, debug = False):
+    '''
+    args: 
+    vertex_locs - a list of type Vector
+    return:
+    normal of best fit plane
+    '''
+    if debug:
+        start = time.time()
+        n_verts = len(locs)
+    
+    # calculating the center of masss
+    com = Vector()
+    for loc in locs:
+        com += loc
+    com /= len(locs)
+    x, y, z = com
+    
+    # creating the covariance matrix
+    mat = Matrix(((0.0, 0.0, 0.0),
+                  (0.0, 0.0, 0.0),
+                  (0.0, 0.0, 0.0),
+                   ))
+    for loc in locs:
+        mat[0][0] += (loc[0]-x)**2
+        mat[1][0] += (loc[0]-x)*(loc[1]-y)
+        mat[2][0] += (loc[0]-x)*(loc[2]-z)
+        mat[0][1] += (loc[1]-y)*(loc[0]-x)
+        mat[1][1] += (loc[1]-y)**2
+        mat[2][1] += (loc[1]-y)*(loc[2]-z)
+        mat[0][2] += (loc[2]-z)*(loc[0]-x)
+        mat[1][2] += (loc[2]-z)*(loc[1]-y)
+        mat[2][2] += (loc[2]-z)**2
+    
+    # calculating the normal to the plane
+    normal = False
+    try:
+        mat.invert()
+    except:
+        if sum(mat[0]) == 0.0:
+            normal = Vector((1.0, 0.0, 0.0))
+        elif sum(mat[1]) == 0.0:
+            normal = Vector((0.0, 1.0, 0.0))
+        elif sum(mat[2]) == 0.0:
+            normal = Vector((0.0, 0.0, 1.0))
+    if not normal:
+        # warning! this is different from .normalize()
+        iters = 0
+        vec = Vector((1.0, 1.0, 1.0))
+        vec2 = (mat * vec)/(mat * vec).length
+        while vec != vec2 and iters < itermax:
+            iters+=1
+            vec = vec2
+            vec2 = mat * vec
+            if vec2.length != 0:
+                vec2 /= vec2.length
+        if vec2.length == 0:
+            vec2 = Vector((1.0, 1.0, 1.0))
+        normal = vec2
+
+
+    if debug:
+        if iters == itermax:
+            print("looks like we maxed out our iterations")
+        print("found plane normal for %d verts in %f seconds" % (n_verts, time.time() - start))
+    
+    return com, normal
 
 
 class CuspWaterDroplet(object):
@@ -335,6 +467,40 @@ def main():
     bme.to_mesh(ob.data)
     bme.free()
 
+def draw_polyline_from_3dpoints(context, points_3d, color, thickness, LINE_TYPE = "GL_LINE_STIPPLE"):
+    '''
+    a simple way to draw a line
+    slow...becuase it must convert to screen every time
+    but allows you to pan and zoom around
+    
+    args:
+        points_3d: a list of tuples representing x,y SCREEN coordinate eg [(10,30),(11,31),...]
+        color: tuple (r,g,b,a)
+        thickness: integer? maybe a float
+        LINE_TYPE:  eg...bgl.GL_LINE_STIPPLE or 
+    '''
+    
+    points = [location_3d_to_region_2d(context.region, context.space_data.region_3d, loc) for loc in points_3d]
+    
+    if LINE_TYPE == "GL_LINE_STIPPLE":  
+        bgl.glLineStipple(4, 0x5555)  #play with this later
+        bgl.glEnable(bgl.GL_LINE_STIPPLE)  
+    bgl.glEnable(bgl.GL_BLEND)
+    
+    bgl.glColor4f(*color)
+    bgl.glLineWidth(thickness)
+    bgl.glBegin(bgl.GL_LINE_STRIP)
+    for coord in points:
+        if coord:
+            bgl.glVertex2f(*coord)
+    
+    bgl.glEnd()  
+      
+    if LINE_TYPE == "GL_LINE_STIPPLE":  
+        bgl.glDisable(bgl.GL_LINE_STIPPLE)  
+        bgl.glEnable(bgl.GL_BLEND)  # back to uninterupted lines  
+        bgl.glLineWidth(1)
+    return
 def draw_3d_points(context, points, color, size):
     '''
     draw a bunch of dots
@@ -753,6 +919,7 @@ class WatershedObjectCurvature(bpy.types.Operator):
         
         mx = context.object.matrix_world
         
+        draw_3d_points(context, [self.com], (1,.1,1,.5), 6)
         if not self.consensus_generated:
             for droplet in self.drops:
                 vs = [mx * self.bme.verts[i].co for i in droplet.ind_path]
@@ -763,13 +930,26 @@ class WatershedObjectCurvature(bpy.types.Operator):
         
         if self.consensus_generated:
             
-            vs = [mx * self.bme.verts[i].co for i in self.concensus_list]
+            vs = [mx * self.bme.verts[i].co for i in self.consensus_list]
             draw_3d_points(context, vs, (.2,.8,.8,1), 5)
             
         if self.sorted_by_value:
             vs = [mx * self.bme.verts[i].co for i in self.best_verts]
             draw_3d_points(context, vs, (.8,.8,.2,1), 3)
-                  
+        
+        
+        if len(self.clipped_verts):
+            vs = [mx * v for v in self.clipped_verts]
+            draw_3d_points(context, vs, (1,.3,1,1), 4)
+            
+            
+        if len(self.bez_curve):
+            vs = [mx * v for v in self.bez_curve]
+            draw_3d_points(context, vs, (.2,1,.2,1), 3)
+        
+        if len(self.polyline):
+            draw_polyline_from_3dpoints(context, self.polyline, (1,1,.2,1), 2)
+                         
     def roll_droplets(self,context):
         count_up = 0
         count_dn = 0
@@ -796,10 +976,10 @@ class WatershedObjectCurvature(bpy.types.Operator):
     
         best = Counter(list_inds)
         
-        consensus_tupples = best.most_common(self.concensus_count)
-        self.concensus_list = [tup[0] for tup in consensus_tupples]
+        consensus_tupples = best.most_common(self.consensus_count)
+        self.consensus_list = [tup[0] for tup in consensus_tupples]
         
-        #print(self.concensus_list)
+        #print(self.consensus_list)
         self.consensus_generated = True
         
     
@@ -813,9 +993,125 @@ class WatershedObjectCurvature(bpy.types.Operator):
         unique_vals = [vals[list_inds.index(ind)] for ind in unique_inds]
         
         bme_inds_by_val = [i for (v,i) in sorted(zip(unique_vals, unique_inds))]
-        self.best_verts = bme_inds_by_val[0:self.concensus_count]
+        self.best_verts = bme_inds_by_val[0:self.consensus_count]
         self.sorted_by_value = True
+    
+    
+    def merge_close_consensus_points(self):
+        '''
+        cusps usually aren't closer than 2mm
+        actually we aren't merging, we just toss the one with less votes
+        '''
+        
+        #consensus list is sorted with most voted for locations first
+        #start at back of list and work forward
+        to_remove = []
+        l_co = [self.bme.verts[i].co for i in self.consensus_list]
+        N = len(l_co)
+        for i, pt in enumerate(l_co):
             
+            if i in to_remove:
+                continue
+            
+            ds, inds = points_within_radius(pt, l_co, 2.5)
+            
+            for j in inds:
+                if j > i:
+                    to_remove.append(j)
+            
+                
+        to_remove = list(set(to_remove))
+        to_remove.sort(reverse = True)
+        
+        print('removed %i too close consensus points' % len(to_remove))
+        print(to_remove)
+        for n in to_remove:
+            l_co.pop(n)
+            
+        
+        
+        self.clipped_verts = l_co
+        
+        return
+        
+    def fit_cubic_consensus_points(self):
+        '''
+        let i's be indices in the actual bmesh
+        let j's be arbitrary list comprehension indices
+        let n's be the incidices in our consensus point lists range 0,len(consensus_list)
+        '''
+        bvs = [self.bme.verts[i] for i in self.consensus_list]  #<- consensus list holds bmesh indices
+        l_co = [self.bme.verts[i].co for i in self.consensus_list]
+        
+        
+        com, no = calculate_plane(l_co)  #an easy way to estimate occlusal plane
+        no.normalize()
+        
+        
+        neigbors = set(l_co)
+        box = bbox(l_co)
+        
+        diag = (box[1]-box[0])**2 + (box[3]-box[2])**2 + (box[5]-box[4])**2
+        diag = math.pow(diag,.5)
+        
+        neighbor_path = [neighbors.pop()]
+        
+        #establish a direction
+        n, v, d  = closest_point(neighbor_path[0], list(neighbors))
+        if d < .2 * diag:
+            neighbor_path.append(v)
+        
+        ended = Fase
+        #while len(neighbors) and not ended:   
+        #   n, v, d  = closest_point(neighbor_path[0], list(neighbors)
+        
+        
+        
+        
+        
+        #flattened spokes
+        rs = [v - v.dot(no)*v - com for v in l_co]
+        
+        R0 = rs[0]
+        
+        theta_dict = {}
+        thetas = []
+        for r, v in zip(rs,l_co):
+            angle = math.fmod(r.angle(R0) + 4*math.pi, 2*math.pi)
+            theta_dict[angle] = v
+            thetas.append(angle)
+        
+        thetas.sort()
+        print(thetas)
+        diffs = [thetas[i]-thetas[i-1] for i in range(0,len(thetas))]
+        #n = diffs.index(max(diffs)) - 1
+        #theta_shift = thetas[n:] + thetas[:n]
+        
+        self.polyline = [theta_dict[theta] for theta in thetas]
+        #inds_in_order = [theta_dict[theta] for theta in thetas]
+        #self.polyline = [l_co[i] for i in inds_in_order]
+        
+        self.com = com
+        
+        '''
+        geom = bmesh.ops.convex_hull(self.bme, input = bvs)
+        qhull = geom['geom']
+
+        verts = [v for v in qhull if str(type(v)) == "<class 'BMVert'>"]
+        eds = [v for v in qhull if str(type(v)) == "<class 'BMEdge'>"]
+        faces = [v for v in qhull if str(type(v)) == "<class 'BMFace>"]
+        
+        
+        l_bpts = cubic_bezier_fit_points(l_co, 3, depth=0, t0=0, t3=1, allow_split=False, force_split=False)
+        self.bez_curve = []
+        for i,bpts in enumerate(l_bpts):
+            t0,t3,p0,p1,p2, p3 = bpts
+            
+            new_pts = [cubic_bezier_blend_t(p0,p1,p2,p3,i/10) for i in range(10+1)]
+            self.bez_curve.extend(new_pts)  
+            
+        '''
+             
     def invoke(self,context, event):
         ob = bpy.context.object
         self.bme = bmesh.new()
@@ -826,16 +1122,21 @@ class WatershedObjectCurvature(bpy.types.Operator):
         
         curv_id = self.bme.verts.layers.float['max_curve']
         
-        rand_sample = list(set([random.randint(0,len(self.bme.verts)-1) for i in range(math.floor(.2 * len(self.bme.verts)))]))
+        rand_sample = list(set([random.randint(0,len(self.bme.verts)-1) for i in range(math.floor(.3 * len(self.bme.verts)))]))
         
         sel_verts = [self.bme.verts[i] for i in rand_sample]
         pln_pt = Vector((0,0,0))  #TODO calc centroid of high curvature
         pln_no = Vector((0,0,1))  #TODO....calc this from PCA analysis of clustered curvature
         self.drops = [CuspWaterDroplet(v, pln_pt, pln_no, curv_id) for v in sel_verts if v.co[2] > 0]
         
-        self.concensus_count = 80
-        self.concensus_list = []
+        self.consensus_count = 80
+        self.consensus_list = []
         self.consensus_generated = False
+        self.bez_curve = []
+        self.polyline = []
+        self.clipped_verts = []
+        self.com = Vector((0,0,0))
+        
         
         self.best_verts = []
         self.sorted_by_value = False
@@ -865,19 +1166,27 @@ class WatershedObjectCurvature(bpy.types.Operator):
         
         
         elif event.type == 'LEFT_ARROW' and event.value == 'PRESS':
-            self.concensus_count -= 5
+            self.consensus_count -= 5
             self.build_concensu(context)
             return {'RUNNING_MODAL'}
         
         elif event.type == 'RIGHT_ARROW' and event.value == 'PRESS':
-            self.concensus_count += 5
+            self.consensus_count += 5
             self.build_concensu(context)
             return {'RUNNING_MODAL'}
         
-        elif event.type == 'B' and event.value == 'PRESS':
+        elif event.type == 'C' and event.value == 'PRESS':
             self.build_concensu(context) 
             return {'RUNNING_MODAL'}
         
+        elif event.type == 'M' and event.value == 'PRESS':
+            self.merge_close_consensus_points()
+            return {'RUNNING_MODAL'}
+            
+        elif event.type == 'B' and event.value == 'PRESS' and self.consensus_generated:
+            self.fit_cubic_consensus_points()
+            return {'RUNNING_MODAL'}
+            
         elif event.type == 'S' and event.value == 'PRESS':
             self.sort_by_value(context)
             return {'RUNNING_MODAL'}
