@@ -21,6 +21,7 @@ import blf
 import bmesh
 import math
 import random
+import time
 from collections import Counter
 from mathutils import Matrix, Vector
 import numpy as np 
@@ -30,6 +31,14 @@ from bpy_extras.view3d_utils import location_3d_to_region_2d, region_2d_to_vecto
 
 from retopoflow.polystrips_utilities import cubic_bezier_fit_points, cubic_bezier_blend_t
 
+def vector_average(l_vecs):
+    v_mean = Vector((0,0,0))
+    for vec in l_vecs:
+        v_mean += vec
+    v_mean *= 1/len(l_vecs)
+    
+    return v_mean
+    
 def bbox(bme_verts):
     '''
     takes a lsit of BMverts ora  list of vectors
@@ -482,9 +491,9 @@ def draw_polyline_from_3dpoints(context, points_3d, color, thickness, LINE_TYPE 
     
     points = [location_3d_to_region_2d(context.region, context.space_data.region_3d, loc) for loc in points_3d]
     
-    if LINE_TYPE == "GL_LINE_STIPPLE":  
-        bgl.glLineStipple(4, 0x5555)  #play with this later
-        bgl.glEnable(bgl.GL_LINE_STIPPLE)  
+    #if LINE_TYPE == "GL_LINE_STIPPLE":  
+    #    bgl.glLineStipple(4, 0x5555)  #play with this later
+    #    bgl.glEnable(bgl.GL_LINE_STIPPLE)  
     bgl.glEnable(bgl.GL_BLEND)
     
     bgl.glColor4f(*color)
@@ -960,12 +969,13 @@ class WatershedObjectCurvature(bpy.types.Operator):
         if len(self.bez_curve):
             vs = [mx * v for v in self.bez_curve]
             draw_polyline_from_3dpoints(context, vs, (.2,1,.2,1), 3)
-        if len(self.polyline):
+            draw_3d_points(context, vs, (.2,1,.2,1), 5)
+        #if len(self.polyline):
             #draw_polyline_from_3dpoints(context, self.polyline, (1,1,.2,1), 2)
             
-            for i, v in enumerate(self.polyline):
-                msg = str(i)
-                draw_3d_text(context, v, msg, 20)
+        #    for i, v in enumerate(self.polyline):
+        #        msg = str(i)
+        #        draw_3d_text(context, v, msg, 20)
                          
     def roll_droplets(self,context):
         count_up = 0
@@ -980,7 +990,7 @@ class WatershedObjectCurvature(bpy.types.Operator):
                 
         return count_dn
 
-    def build_concensu(self,context):
+    def build_concensus(self,context):
         
         list_inds = [drop.dn_vert.index for drop in self.drops]
         vals = [drop.dnH for drop in self.drops]
@@ -997,7 +1007,12 @@ class WatershedObjectCurvature(bpy.types.Operator):
         
         consensus_tupples = best.most_common(self.consensus_count)
         self.consensus_list = [tup[0] for tup in consensus_tupples]
+        self.consensus_dict = {}  #throw it all away?
         
+        #map consensus to verts.  Later we will merge into this dict
+        for tup in consensus_tupples:
+            self.consensus_dict[tup[0]] = tup[1]
+            
         #print(self.consensus_list)
         self.consensus_generated = True
         
@@ -1127,12 +1142,15 @@ class WatershedObjectCurvature(bpy.types.Operator):
         
         self.com = com
 
-        l_bpts = cubic_bezier_fit_points(self.polyline, 4, depth=0, t0=0, t3=1, allow_split=True, force_split=True)
+        l_bpts = cubic_bezier_fit_points(self.polyline, 1, depth=0, t0=0, t3=1, allow_split=True, force_split=False)
         self.bez_curve = []
+        N = 20
         for i,bpts in enumerate(l_bpts):
             t0,t3,p0,p1,p2, p3 = bpts
             
-            new_pts = [cubic_bezier_blend_t(p0,p1,p2,p3,i/15) for i in range(15+1)]
+
+            new_pts = [cubic_bezier_blend_t(p0,p1,p2,p3,i/N) for i in range(0,N)]
+            
             self.bez_curve.extend(new_pts)  
              
     def invoke(self,context, event):
@@ -1145,15 +1163,16 @@ class WatershedObjectCurvature(bpy.types.Operator):
         
         curv_id = self.bme.verts.layers.float['max_curve']
         
-        rand_sample = list(set([random.randint(0,len(self.bme.verts)-1) for i in range(math.floor(.1 * len(self.bme.verts)))]))
+        rand_sample = list(set([random.randint(0,len(self.bme.verts)-1) for i in range(math.floor(.05 * len(self.bme.verts)))]))
         
         sel_verts = [self.bme.verts[i] for i in rand_sample]
         pln_pt = Vector((0,0,0))  #TODO calc centroid of high curvature
         pln_no = Vector((0,0,1))  #TODO....calc this from PCA analysis of clustered curvature
-        self.drops = [CuspWaterDroplet(v, pln_pt, pln_no, curv_id) for v in sel_verts if v.co[2] > 0]
+        self.drops = [CuspWaterDroplet(v, pln_pt, pln_no, curv_id) for v in sel_verts]
         
-        self.consensus_count = 80
+        self.consensus_count = 10
         self.consensus_list = []
+        self.consensus_dict = {}
         self.consensus_generated = False
         self.bez_curve = []
         self.polyline = []
@@ -1183,6 +1202,101 @@ class WatershedObjectCurvature(bpy.types.Operator):
             
             return {'FINISHED'}
           
+        
+        
+        elif event.type == 'Q' and event.value == 'PRESS':
+            n_rolling = self.roll_droplets(context)
+            
+            iters = 0
+            while n_rolling > 5 and iters < 400:
+                n_rolling = self.roll_droplets(context)
+                iters += 1
+                
+            if iters >= 399:
+                print('too much rolling')    
+            
+            self.consensus_count = 20    
+            self.build_concensus(context)
+            
+            l_co = [self.bme.verts[i].co for i in self.consensus_list]
+            test_no = vector_average([self.bme.verts[i].normal for i in self.consensus_list])
+            test_no.normalize()
+            pt, pno = calculate_plane(l_co)
+            
+            
+            if pno.dot(test_no) < 0:
+                pno *= -1
+            
+            self.pln_pt = pt - 5*pno
+            self.pln_no = pno
+                
+            mx = context.object.matrix_world
+            imx = mx.inverted()
+            no_mx = mx.transposed().inverted().to_3x3()
+            
+            
+            Z = no_mx * pno
+            loc = mx * pt - 5 * Z
+            
+            ob_y = no_mx * Vector((0,1,0))
+            X = ob_y.cross(Z)
+            Y = Z.cross(X)
+            
+            Z.normalize()
+            Y.normalize()
+            X.normalize()
+            
+            wmx = Matrix.Identity(4)
+            wmx[0][0], wmx[1][0], wmx[2][0] = X[0], X[1], X[2]
+            wmx[0][1], wmx[1][1], wmx[2][1] = Y[0], Y[1], Y[2]
+            wmx[0][2], wmx[1][2], wmx[2][2] = Z[0], Z[1], Z[2]
+            wmx[0][3], wmx[1][3], wmx[2][3] = loc[0], loc[1], loc[2]
+            
+            #circ_bm = bmesh.new()
+            #bmesh.ops.create_circle(circ_bm, cap_ends = True, cap_tris = False, segments = 10, diameter = .5 *min(context.object.dimensions) + .5 *max(context.object.dimensions))
+            
+            # Finish up, write the bmesh into a new mesh
+            #me = bpy.data.meshes.new("Occlusal Plane")
+            #circ_bm.to_mesh(me)
+            #circ_bm.free()
+
+            # Add the mesh to the scene
+            #scene = bpy.context.scene
+            #obj = bpy.data.objects.new("Object", me)
+            #scene.objects.link(obj)
+            #obj.matrix_world = wmx
+            return {'RUNNING_MODAL'}
+        
+        
+        elif event.type == 'W' and event.value == 'PRESS':
+            curv_id = self.bme.verts.layers.float['max_curve']
+            
+            start = time.time()
+            cut_geom = self.bme.faces[:] + self.bme.verts[:] + self.bme.edges[:]
+            bmesh.ops.bisect_plane(self.bme, geom = cut_geom, dist = .000001, plane_co = self.pln_pt, plane_no = self.pln_no, use_snap_center = False, clear_outer=False, clear_inner=True)
+            self.bme.verts.ensure_lookup_table()
+            self.bme.faces.ensure_lookup_table()
+            
+            
+            rand_sample = list(set([random.randint(0,len(self.bme.verts)-1) for i in range(math.floor(.2 * len(self.bme.verts)))]))
+            self.drops = [CuspWaterDroplet(self.bme.verts[i], self.pln_pt, self.pln_no, curv_id) for i in rand_sample]
+            dur = time.time() - start
+            print('took %f seconds to cut the mesh and generate drops' % dur)
+            
+            start = time.time()
+            n_rolling = self.roll_droplets(context)
+            iters = 0
+            while n_rolling > 10 and iters < 100:
+                n_rolling = self.roll_droplets(context)
+                iters += 1
+            
+            self.consensus_count = 80
+            self.build_concensus(context)
+            
+            dur = time.time() - start
+            print('took %f seconds to roll the drops' % dur)
+            return {'RUNNING_MODAL'}
+               
         elif event.type == 'UP_ARROW' and event.value == 'PRESS':
             n_rolling = self.roll_droplets(context)
             
@@ -1195,16 +1309,16 @@ class WatershedObjectCurvature(bpy.types.Operator):
         
         elif event.type == 'LEFT_ARROW' and event.value == 'PRESS':
             self.consensus_count -= 5
-            self.build_concensu(context)
+            self.build_concensus(context)
             return {'RUNNING_MODAL'}
         
         elif event.type == 'RIGHT_ARROW' and event.value == 'PRESS':
             self.consensus_count += 5
-            self.build_concensu(context)
+            self.build_concensus(context)
             return {'RUNNING_MODAL'}
         
         elif event.type == 'C' and event.value == 'PRESS':
-            self.build_concensu(context) 
+            self.build_concensus(context) 
             return {'RUNNING_MODAL'}
         
         elif event.type == 'M' and event.value == 'PRESS':
