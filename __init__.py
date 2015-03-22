@@ -9,22 +9,26 @@ bl_info = {
     "version": (1, 0),
     "blender": (2, 74, 0),
     "location": "",
-    "description": "Draws things on object in View3D",
+    "description": "Curvature and Harmonic utilities for analsis and segmentation",
     "warning": "",
     "wiki_url": "", 
     "category": "Object"}
 
 
-import bpy
-import bgl
-import blf
-import bmesh
+
 import math
 import random
 import time
 from collections import Counter
-from mathutils import Matrix, Vector
 import numpy as np 
+from scipy import sparse
+from scipy.sparse import linalg
+
+import bpy
+import bgl
+import blf
+import bmesh
+from mathutils import Matrix, Vector
 from bpy_extras import view3d_utils
 from bpy.props import BoolProperty, FloatProperty, IntProperty
 from bpy_extras.view3d_utils import location_3d_to_region_2d, region_2d_to_vector_3d, region_2d_to_location_3d, region_2d_to_origin_3d
@@ -53,6 +57,15 @@ def bbox(bme_verts):
     zs = [v[2] for v in verts]
     
     return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+
+def vert_neighbors(bmv):
+    '''
+    todo, locations, indices or actual verts.
+    reverse?
+    '''
+    verts = [ed.other_vert(bmv) for ed in bmv.link_edges]
+    
+    return verts
 
 def closest_point(pt, locs):
     ds = [(loc - pt).length for loc in locs]
@@ -92,14 +105,6 @@ def points_within_radius(pt, locs, R):
     inds = [dist_inds[D] for D in ds]
     vs = [locs[i] for i in inds]
     return (ds, inds, vs)
-    
-    
-    
-    
-    
-    best = ds.index(min(ds))
-    
-    return (best, locs[best], ds[best])
 
 
 def calculate_plane(locs, itermax = 500, debug = False):
@@ -170,7 +175,139 @@ def calculate_plane(locs, itermax = 500, debug = False):
     
     return com, normal
 
+def concave(bmvert, lam):
+    '''
+    bmverts - BMVert in a BMesh
+    lam(bda) - small float value  1e-4 to 1e-6 seems to work well.
+               can be small negative value too.
+    this fn has been verified
+    '''
+    if len(bmvert.link_edges) == 0:
+        return 0
+    vks = [v.co for v in vert_neighbors(bmvert)]
+    vavg = vector_average(vks)
+    
+    vdiff = vavg - bmvert.co
+    vdiff.normalize()
+    no = bmvert.normal
+    
+    if vdiff.dot(no) > lam:
+        #bmvert.select = True  #used for ferification
+        return 1
+    else:
+        return 0
+    
+def gammaij(bmedge, conc_id, fs, fl):
+    '''
+    bmedge - the bemseh edge
+    conc_id - the flag for id data stored on bmesh verst
+    This fn is unsure because of ambiguity with fs and fl
+    '''
+    
+    vi = bmedge.verts[0]
+    vj = bmedge.verts[1]
+    
+    if vi[conc_id] == 1 or vj[conc_id] == 1:
+        return fs
+    else:
+        return fl
+    
+def alpha_beta(bmed):
+    '''
+    this fn has been tested and verified
+    '''
+    
+    if len(bmed.link_faces) != 2:
+        return None, None
+    else:
+        falpha = bmed.link_faces[0]
+        fbeta  = bmed.link_faces[1]
+        
+        valpha = [v for v in falpha.verts if not bmed.other_vert(v)][0]
+        vbeta  = [v for v in fbeta.verts if not bmed.other_vert(v)][0]
 
+        #valpha.select = True
+        #vbeta.select = True
+        
+        
+        V0a = bmed.verts[0].co - valpha.co
+        V1a = bmed.verts[1].co - valpha.co
+        V0b = bmed.verts[0].co - vbeta.co
+        V1b = bmed.verts[1].co - vbeta.co
+        
+        alpha = V0a.angle(V1a)
+        beta  = V0b.angle(V1b)
+
+        return alpha, beta
+    
+def wij(bmed, conc_id, fs, fl):
+    '''
+    cotangent weight function
+    fn unsure until gammaij and fs and fl are verified
+    '''
+    
+    alpha, beta = alpha_beta(bmed)
+    gamma = gammaij(bmed, conc_id, fs, fl)
+    
+    if math.tan(alpha) * math.tan(alpha) < .0000001:
+        return 100000
+    weight = 1/2 * gamma * ( 1/math.tan(alpha) + 1/math.tan(beta))
+    
+    return weight
+
+def manifold_eds(bme):
+    '''
+    make sure to exclude non manifold edges
+    '''
+    man_eds_L= [ed.index for ed in bme.edges if ed.is_manifold]
+    manifold_eds = set(man_eds_L)
+    
+    
+    return manifold_eds
+
+def non_manifold_eds(bme):
+    '''
+    make sure to exclude non manifold edges
+    '''
+    non_man_eds= [ed.index for ed in bme.edges if not ed.is_manifold]
+    return non_man_eds
+
+def manifold_verts(bme):
+    '''
+    make sure to exclude non manifold verts?
+    '''
+    all_verts = set([v.index for v in bme.verts])
+    
+    non_man_verts = set()
+    non_man_eds = non_manifold_eds(bme)
+    
+    for i in non_man_eds:
+        non_man_verts.add(bme.edges[i].verts[0].index)
+        non_man_verts.add(bme.edges[i].verts[1].index)
+        
+    manifold_vs = all_verts - non_man_verts
+    return manifold_vs
+ 
+def get_constraint_verts(ob):
+    g1 = ob.vertex_groups["Verts 1"].index # get group index
+    g0 = ob.vertex_groups["Verts 0"].index # get group index
+    g5 = ob.vertex_groups["Verts 0.5"].index # get group index
+
+    verts0 = set()
+    verts1 = set()
+    verts5 = set()
+    
+    for v in ob.data.vertices:
+        for g in v.groups:
+            if g.group == g0: # compare with index in VertexGroupElement
+                verts0.add(v.index)
+            elif g.group == g1:
+                verts1.add(v.index)  
+            elif g.group == g5:
+                verts5.add(v.index)
+
+    return verts0, verts1, verts5
+    
 class CuspWaterDroplet(object):
     def __init__(self, bmvert, pln_pt, pln_no, curv_id):
         
@@ -259,13 +396,10 @@ def walk_from_vert(vert, prev_vert, steps, scalar_id, dir = None):
                     np.append(b)
                     new_paths.append(np)
             else:
-                new_paths.append(path)
+                new_paths.append(vpath)
                     
         v_paths = new_paths
             
-            
-        
-    
     qualities = [] 
     for path in v_paths:
         quality = 0
@@ -348,16 +482,6 @@ def walk_down_path (path, steps, scalar_id, dir = None):
     
     return v_paths[best]
 
-def vert_neighbors(bmv):
-    '''
-    todo, locations, indices or actual verts.
-    reverse?
-    '''
-    verts = [ed.other_vert(bmv) for ed in bmv.link_edges]
-    
-    return verts
-           
-    
 def calc_curvature(v):
     if False in [ed.is_manifold for ed in v.link_edges]:
         return 0
@@ -370,10 +494,7 @@ def calc_curvature(v):
     normal = v.normal
     Nvi = np.matrix(normal)
     # get sorted 1-ring
-    ring = vert_neighbors(v)
-    
-    
-        
+    ring = vert_neighbors(v) 
     # calculate face weightings, wij
     wij = []
     n = len(ring)
@@ -413,27 +534,22 @@ def calc_curvature(v):
     
     return evals[max_ind]
         
-
 def aniso_smooth(bmv, max_id):
     if bmv[max_id] == 0:
         return 0
     ring = vert_neighbors(bmv)
     curvs = [vert[max_id] for vert in ring]
-    
     if bmv[max_id] < 0:
         curvs.sort(reverse = True)
     else:
         curvs.sort()
-    
+
     new_curv = .6 * bmv[max_id] +.3*curvs[0] + .1*curvs[1]     
-    
     return new_curv
 
 def curvature_on_mesh(bme):
     '''calc initial curvature on bmesh'''
-    
     #create custom data layers
-    
     if 'max_curve' in bme.verts.layers.float:
         print('Data Layer Exists')
         max_id = bme.verts.layers.float['max_curve']
@@ -443,36 +559,28 @@ def curvature_on_mesh(bme):
     
     for v in bme.verts:
         v[max_id] = calc_curvature(v)
-    
-       
+           
 def smooth_scalar_mesh_curvature(bme):
     max_id = bme.verts.layers.float['max_curve']
     new_curves = [aniso_smooth(bmv, max_id) for bmv in bme.verts] 
     for v in bme.verts:
         v[max_id] = new_curves[v.index]
-
     return np.mean(new_curves), np.std(new_curves)
  
 def main():
     ob = bpy.context.object
     bme = bmesh.new()
     bme.from_mesh(ob.data)
-
-    
     curvature_on_mesh(bme)
-    
     max_id = max_id = bme.verts.layers.float['max_curve']
-    
     for i in range(0,5):
         avg, std_dev = smooth_scalar_mesh_curvature(bme)
-
     curves = [v[max_id] for v in bme.verts]
     avg = np.mean(curves)
     std_dev = np.std(curves)
     for v in bme.verts:
         if v[max_id] > avg + .2 * std_dev:
             v.select = True
-    
     bme.to_mesh(ob.data)
     bme.free()
 
@@ -488,7 +596,6 @@ def draw_polyline_from_3dpoints(context, points_3d, color, thickness, LINE_TYPE 
         thickness: integer? maybe a float
         LINE_TYPE:  eg...bgl.GL_LINE_STIPPLE or 
     '''
-    
     points = [location_3d_to_region_2d(context.region, context.space_data.region_3d, loc) for loc in points_3d]
     
     #if LINE_TYPE == "GL_LINE_STIPPLE":  
@@ -510,6 +617,7 @@ def draw_polyline_from_3dpoints(context, points_3d, color, thickness, LINE_TYPE 
         bgl.glEnable(bgl.GL_BLEND)  # back to uninterupted lines  
         bgl.glLineWidth(1)
     return
+
 def draw_3d_points(context, points, color, size):
     '''
     draw a bunch of dots
@@ -547,9 +655,7 @@ def draw_3d_text(context, pt, msg, size):
     blf.position(font_id, point_2d[0], point_2d[1], 0)
     blf.size(font_id, size, 72)
     blf.draw(font_id, msg)
-    
     return
-
 
 class ViewOperatorObjectCurve(bpy.types.Operator):
     """Modal object selection with a ray cast"""
@@ -575,26 +681,18 @@ class ViewOperatorObjectCurve(bpy.types.Operator):
             max = 4,
             )
     def draw_callback_verts(self, context):
-
-
-    
         mx = context.object.matrix_world
         coords = [v.co for v in self.path]
         draw_3d_points(context, coords, (1,.1,.1,1), 4)
-        
-     
 
-        
     def modal(self, context, event):
         context.area.tag_redraw()
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
             # allow navigation
             return {'PASS_THROUGH'}
         
-        
         elif event.type == 'MOUSEMOVE':
             return {'RUNNING_MODAL'}
-        
         
         elif event.type == 'G' and event.value == 'PRESS':
             self.start_walking(context, event)
@@ -611,10 +709,10 @@ class ViewOperatorObjectCurve(bpy.types.Operator):
         elif event.type == 'UP_ARROW' and event.value == 'PRESS':
             self.big_steps += 1
             return {'RUNNING_MODAL'}
+        
         elif event.type == 'DOWN_ARROW' and event.value == 'PRESS':
             if self.stpes > 3:
                 self.big_steps -= 1
-                
             return {'RUNNING_MODAL'}
 
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
@@ -1340,16 +1438,625 @@ class WatershedObjectCurvature(bpy.types.Operator):
             return {'CANCELLED'}
         else:
             return {'PASS_THROUGH'}        
+
+class HarmonicOperator(bpy.types.Operator):
+    """Puts harmonic Field on Mesh"""
+    bl_idname = "object.harmonic_field"
+    bl_label = "Harmonic Calculator"
+
+    recalc_concavity = BoolProperty(
+            name="recalc concavity",
+            description = "Recalc Concavity, important if you have sculpted or changed mesh",
+            default=False,
+            )
+    
+    recalc_wij = BoolProperty(
+            name="recalc wij",
+            description = "Recalc Concavity, important if you have sculpted or changed mesh",
+            default=False,
+            )
+    
+    method = IntProperty(
+            name="method",
+            description = "0 = lsqr, 1 = lsmr, 4 = NumPy",
+            default=0,
+            )
+    
+    damping = FloatProperty(
+            name="damping",
+            description = "damping for least squares solver.  Se scipy.sparse.linalg",
+            default=0,
+            )
+    normalize_phi = BoolProperty(
+            name="Normalize Phi",
+            description = "Scales phi values from 0 to 1",
+            default=True,
+            )
+    
+    max_iters = IntProperty(
+            name="Max Iters",
+            description = "Limits number of matrix solver iterations",
+            default=5000,
+            )
+    
+    phi_to_faces = BoolProperty(
+            name="Per Face Phi",
+            description = "Puts mean phi value on faces",
+            default=True,
+            )
+    phi_to_group = BoolProperty(
+            name="Vert Group",
+            description = "Puts phi valies as weight in vertex group",
+            default=True,
+            )
+    
+    w = IntProperty(
+            name="w",
+            description = "w is a large constant, 200 to 10000.  Default 1000 in paper",
+            default=1000,
+            )
+    
+    fs = FloatProperty(
+            name="fs",
+            description = "fs is a small constant,  Default .001.  See p135, p138 in [2]",
+            default=.001,
+            )
+    
+    fl = FloatProperty(
+            name="fl",
+            description = "fl is a constant,  Default 1  See p135, p138 in [2] ",
+            default=1,
+            )
+    @classmethod
+    def poll(cls, context):
+        cond0 = context.active_object is not None 
+        cond1 = context.active_object.type == 'MESH'
+        cond2 = context.mode != 'PAINT_WEIGHT'
+        return cond0 and cond1 and cond2
+
+    def invoke(self,context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+    def draw(self, context):
+        layout = self.layout
+        row =layout.row()
+        row.prop(self, "recalc_concavity")
+        row.prop(self, "recalc_wij")
+        
+        row =layout.row()
+        row.prop(self, "max_iters")
+        row.prop(self, "damping")
+        row.prop(self, "method")
+        
+        row =layout.row()
+        row.prop(self, "w")
+        row.prop(self, "fs")
+        row.prop(self, "fl")
+        
+        row =layout.row()
+        row.prop(self, "phi_to_group")
+        row.prop(self, "phi_to_faces")
+        row.prop(self, "normalize_phi")
+        pass
+    
+        
+        
+    def execute(self, context):
+        
+        w = self.w
+        fs = self.fs
+        fl = self.fl
+        
+        
+        ##TODOO###
+        #check for 3 vertex groups corresponding to constraints
+        #Check for non manifold edge.  If so, make sure constraint is appropraite
+        
+        bme = bmesh.new()
+        bme.from_mesh(context.object.data)
+        #check for triangles only TODO
+
+        bme.verts.ensure_lookup_table()
+        bme.edges.ensure_lookup_table()
+        bme.faces.ensure_lookup_table()
+        
+        #Check for non manifold edge loop
+        #and assign boundary as necessary
+        
+        if 'concave' in bme.verts.layers.int:
+            concave_override = False
+            conc_id = bme.verts.layers.int['concave']
+        else:
+            concave_override = True
+            conc_id = bme.verts.layers.int.new('concave')
+        if 'wij' in bme.edges.layers.float:
+            wij_override = False
+            wij_id = bme.edges.layers.float['wij']
+        else:
+            wij_override = True
+            wij_id = bme.edges.layers.float.new('wij')  
+        
+        if 'phi' in bme.verts.layers.float:
+            phi_id = bme.verts.layers.float['phi']
+        else:
+            phi_id = bme.verts.layers.float.new('phi')  
+        
+        if 'phi' in bme.faces.layers.float:
+            phi_face_id = bme.faces.layers.float['phi']
+        else:
+            phi_face_id = bme.faces.layers.float.new('phi') 
+            
+        #v_inds = manifold_verts(bme)
+        v_inds = [v.index for v in bme.verts]  #until we figure out this manifold thing
+        e_inds = manifold_eds(bme)    
+        if self.recalc_concavity or concave_override:
+            for ind in v_inds:
+                bme.verts[ind][conc_id] = concave(bme.verts[ind], .00001)
+        
+        if self.recalc_wij or wij_override:
+            for ind in e_inds:
+                bme.edges[ind][wij_id] = wij(bme.edges[ind],conc_id, fs, fl)
+        
+        
+        m = len(v_inds)
+        m_ed = len(e_inds)
+        
+        verts0, verts1, verts5 = get_constraint_verts(bpy.context.object)
+        #make sure our constraints dont have non manifold geom in them
+        #hint...they do
+        verts0.intersection_update(v_inds)
+        verts1.intersection_update(v_inds)
+        verts5.intersection_update(v_inds)
+        S = list(verts0) + list(verts1) + list(verts5)
+        n = len(S)
+        
+        Vals = np.zeros(m + 2*m_ed + n)
+        Is = np.zeros(m + 2*m_ed + n)
+        Js = np.zeros(m + 2*m_ed + n)
+        
+        v_list = list(v_inds)
+        v_map_to_bm = {}
+        v_map_fr_bm = {}
+        
+        for i,v_ind in enumerate(v_inds):
+            v_map_to_bm[i] = v_ind  #when we actually solve, we gotta put that on the mesh!
+            v_map_fr_bm[v_ind] = i  #these are redundant right now, because we are using all verts
+            
+            Vals[i] = sum([ed[wij_id] for ed in bme.verts[v_ind].link_edges])
+            Is[i] = i
+            Js[i] = i
+        
+        #edge values get filled in at the ij and ji locations?
+        for i, e_ind in enumerate(e_inds):
+            ed = bme.edges[e_ind]
+            w_ij = ed[wij_id]
+            
+            Vals[2*i+m] = -w_ij
+            Vals[2*i + m + 1] = -w_ij
+            Is[2*i + m] = v_map_fr_bm[ed.verts[0].index]
+            Js[2*i + m] = v_map_fr_bm[ed.verts[1].index]
+            Is[2*i + m + 1] =v_map_fr_bm[ed.verts[1].index]
+            Js[2*i + m + 1] = v_map_fr_bm[ed.verts[0].index]
+        
+        b = np.zeros(m+n)
+        for j, i in enumerate(S):
+            if i in verts0:
+                b[m + j] = 0  #may need to do a -1 index 
+                
+            elif i in verts1:
+                b[m + j] = w
+                
+            elif i in verts5:
+                b[m + j] = .5 * w
+                
+            Vals[m + 2*m_ed + j] = w
+            Is[m + 2*m_ed + j] =   m + j 
+            Js[m + 2*m_ed + j] =   v_map_fr_bm[i]
+            
+            
+        
+        
+        A = sparse.coo_matrix((Vals,(Is,Js)),shape=(m + n, m))
+        A.tocsr()
+        
+        start = time.time()
+        
+        if self.method == 4:
+            phi = np.linalg.lstsq(A.todense(),b)
+            method = 'NumPy'
+        elif self.method == 0:
+            phi = linalg.lsmr(A,b, damp = self.damping, atol = 1e-11, btol = 1e-11, maxiter = self.max_iters)
+            method = 'SciPy Sparse lsmr'
+        elif self.method == 1:
+            phi = linalg.lsqr(A,b, damp = self.damping, atol = 1e-11, btol = 1e-11, iter_lim = self.max_iters)
+            method = 'SciPy Sparse lswr'    
+        
+        duration = time.time() - start
+        print('took %f seconds to solve with %s' % (duration, method))
+        print('took %i iterations' % phi[2])
+        
+        for i, elem in enumerate(phi[0]):
+            bme.verts[v_map_to_bm[i]][phi_id] = elem
+        
+        
+
+        phis = [v[phi_id] for v in bme.verts]
+
+        
+        
+        if self.normalize_phi: 
+            B = max(phis)
+            A = min(phis)
+        
+            normalized = [[0]]*len(phis)
+            for i, phi in enumerate(phis):
+                normalized[i] = (phi - A)/(B-A)
+            
+            phis = normalized
+            
+            for i, v in enumerate(bme.verts):
+                v[phi_id] = phis[i]
+                
+        bme.to_mesh(bpy.context.object.data)
+        bme.free()    
+        #check for existing group with the same name
+        if None == context.object.vertex_groups.get("Phi"): 
+            context.object.vertex_groups.new(name = "Phi")  
+        
+        group_ind = context.object.vertex_groups["Phi"].index
+        
+        for i, vert in enumerate(context.object.data.vertices):
+            weight = phis[i]               
+            context.object.vertex_groups[group_ind].add([i], weight,'REPLACE')
+        
+        
+        return {'FINISHED'}
+
+class HarmonicInspector(bpy.types.Operator):
+    """Displays the harmonic Field on Mesh"""
+    bl_idname = "object.harmoic_inspector"
+    bl_label = "Harmonic Viewer Operator"
+
+    def draw_callback_px(self, context):
+        font_id = 0  # XXX, need to find out how best to get this.
+    
+        # draw some text
+        blf.position(font_id, self.pos[0], self.pos[1] + 10, 0)
+        blf.size(font_id, 20, 72)
+        blf.draw(font_id, self.msg)
+        
+    def modal(self, context, event):
+        context.area.tag_redraw()
+        
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+            # allow navigation
+            return {'PASS_THROUGH'}
+        
+        elif event.type == 'LEFTMOUSE':
+            main(context, event)
+            return {'RUNNING_MODAL'}
+        elif event.type in {'RIGHTMOUSE', 'ESC'}:
+            bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            self.bme.to_mesh(context.object.data)
+            self.bme.free()
+            return {'CANCELLED'}
+        
+        elif event.type in {'MOUSEMOVE'}:
+            
+            self.pick_face(context, event)
+
+            return {'RUNNING_MODAL'}
+
+        return {'RUNNING_MODAL'}
+
+    def pick_face(self, context, event, ray_max=1000.0):
+        """Run this function on mouse move, execute the ray cast"""
+        # get the context arguments
+        scene = context.scene
+        region = context.region
+        rv3d = context.region_data
+        coord = event.mouse_region_x, event.mouse_region_y
+        obj = context.object
+        self.pos = [coord[0], coord[1]]
+        
+        # get the ray from the viewport and mouse
+        view_vector = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+    
+        if rv3d.view_perspective == 'ORTHO':
+            # move ortho origin back
+            ray_origin = ray_origin - (view_vector * (ray_max / 2.0))
+    
+        ray_target = ray_origin + (view_vector * ray_max)
+        
+        def obj_ray_cast(obj, matrix):
+            """Wrapper for ray casting that moves the ray into object space"""
+    
+            # get the ray relative to the object
+            matrix_inv = matrix.inverted()
+            ray_origin_obj = matrix_inv * ray_origin
+            ray_target_obj = matrix_inv * ray_target
+    
+            # cast the ray
+            hit, normal, face_index = obj.ray_cast(ray_origin_obj, ray_target_obj)
+    
+            if face_index != -1:
+                return hit, normal, face_index
+            else:
+                return None, None, None
+            
+        hit, normal, face_index = obj_ray_cast(obj, obj.matrix_world)
+        if hit is not None:
+            phis = [v[self.phi_id] for v in self.bme.faces[face_index].verts]
+
+            self.msg = str(sum(phis)/len(phis))[0:4]
+        else:
+            self.msg = "Hover the Object"
+            
+        
+    def invoke(self, context, event):
+        if context.space_data.type == 'VIEW_3D':
+            context.window_manager.modal_handler_add(self)
+            self._handle = bpy.types.SpaceView3D.draw_handler_add(self.draw_callback_px, (context,), 'WINDOW', 'POST_PIXEL')
+            
+            
+            self.bme = bmesh.new()
+            self.bme.from_mesh(context.object.data)
+            self.bme.verts.ensure_lookup_table()
+            self.bme.edges.ensure_lookup_table()
+            self.bme.faces.ensure_lookup_table()
+            self.msg = 'Hover The Object'
+            self.obj = context.object
+            self.pos = [event.mouse_region_x, event.mouse_region_y]
+            
+            if 'phi' in self.bme.verts.layers.float:
+                self.phi_id = self.bme.verts.layers.float['phi']
+            else:
+                return {'CANCELLED'}
+            
+            return {'RUNNING_MODAL'}
+        else:
+            self.report({'WARNING'}, "Active space must be a View3d")
+            return {'CANCELLED'}
+
+
+class HarmonicIsolineWalker(bpy.types.Operator):
+    """Displays the harmonic Field on Mesh"""
+    bl_idname = "object.harmoic_isoline_walker"
+    bl_label = "Harmonic Isoline"
+
+    def draw_callback_px(self, context):
+        font_id = 0  # XXX, need to find out how best to get this.
+    
+        # draw some text
+        blf.position(font_id, self.pos[0], self.pos[1] + 10, 0)
+        blf.size(font_id, 20, 72)
+        blf.draw(font_id, self.msg)
+        
+        
+        blf.position(font_id, 30, 30, 0)
+        blf.size(font_id, 20, 72)
+        blf.draw(font_id, str(self.iso_val))
+        
+        
+        if len(self.isoline):
+            draw_polyline_from_3dpoints(context, self.isoline, (1,0,0,1), 2, LINE_TYPE = "GL_LINE_STRIP")
+    
+    
+    
+    def walk_face(self):
+        
+        for ed in self.current_face.edges:
+            if ed != self.last_edge:
+                vals = [ed.verts[0][self.phi_id], ed.verts[1][self.phi_id]]
+            
+                if min(vals) <= self.iso_val and max(vals) > self.iso_val:
+                    faces = [f.index for f in ed.link_faces if f.index != self.current_face.index and f.index != self.iso_pt]
+                    
+                    if len(faces):
+                        self.current_face = faces[0]
+                        self.last_edge = ed
+                    
+                        v_diff = ed.verts[1].co - ed.verts[0].co 
+                        a = (self.iso_val - ed.verts[0][self.phi_id])/(ed.verts[1][self.phi_id] - ed.verts[0][self.phi_id])
+                
+                        co = ed.verts[0] + a * v_diff
+                
+                        return co
+        return None
+    
+    def find_loops(self):
+        
+        if not self.current_face:
+            self.msg = 'Click a Face'
+            return
+        
+        self.current_face = self.bme.faces[self.iso_pt]
+        vals = [v[self.phi_id] for v in self.current_face.verts] 
+        if vals[0] == vals[1] == vals[2]:
+            self.msg = 'Equal Face'
+            return
+        
+        good_eds = []
+        good_fs = []
+        for ed in self.current_face.edges:
+            e_vals = [ed.verts[0][self.phi_id], ed.verts[1][self.phi_id]]
+            if min(e_vals) < self.iso_val and max(e_vals) > self.iso_val:
+                good_eds.append(ed)
+                good_fs.apped([f for f in ed.link_faces if f.index != self.current_face.index][0])
+        
+        print('there are %i good fs' % len(good_fs))
+        print('there are %i good eds' % len(good_eds)) 
+        
+        if len(good_eds) != 2 and len(good_eds) != len(good_fs):
+            print('problem')
+            return
+        
+        verts = []
+        max_iters = 1000
+        for ed, f in zip(good_eds, good_fs):
+            v_diff = ed.verts[1].co - ed.verts[0].co 
+            a = (self.iso_val - ed.verts[0][self.phi_id])/(ed.verts[1][self.phi_id] - sed.verts[0][self.phi_id])  
+            new_co = ed.verts[0] + a * v_diff
+            vert_list = [new_co]
+            self.current_face = f
+            self.last_edge = ed
+            iters = 0
+            while new_co and iters < max_iters:
+                new_co = self.walk_face()
+                vert_list.append(new_co)
+                iters += 1
+                
+            verts.append(vert_list)
+                
+        self.isoline = verts[0] + verts[1].reverse()
+                
+    def modal(self, context, event):
+        context.area.tag_redraw()
+        
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+            # allow navigation
+            return {'PASS_THROUGH'}
+        
+        elif event.type == 'LEFTMOUSE':
+            self.set_iso_seed()
+            
+            return {'RUNNING_MODAL'}
+        
+        
+        elif event.type == 'I':
+            
+            self.find_loops()
+            
+            return {'RUNNING_MODAL'}
+        
+        elif event.type == 'UP_ARROW':
+            
+            vals = [v[self.phi_id] for v in self.bme.faces[self.iso_pt].verts]
+            max_i = max(vals)
+            min_i = min(vals)
+            
+            self.iso_val += (max_i - min_i)/10
+            
+            if self.iso_val > max_i:
+                self.iso_val = max_i
+            
+            return {'RUNNING_MODAL'}    
+        elif event.type == 'DN_ARROW':
+            
+            vals = [v[self.phi_id] for v in self.bme.faces[self.iso_pt].verts]
+            max_i = max(vals)
+            min_i = min(vals)
+            
+            self.iso_val -= (max_i - min_i)/10
+            
+            if self.iso_val < min_i:
+                self.iso_val = min_i
+                
+            return {'RUNNING_MODAL'}
+                    
+        elif event.type in {'RIGHTMOUSE', 'ESC'}:
+            bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            self.bme.to_mesh(context.object.data)
+            self.bme.free()
+            return {'CANCELLED'}
+        
+        elif event.type in {'MOUSEMOVE'}:
+            
+            self.pick_face(context, event)
+
+            return {'RUNNING_MODAL'}
+
+        return {'RUNNING_MODAL'}
+
+    def pick_face(self, context, event, ray_max=1000.0):
+        """Run this function on mouse move, execute the ray cast"""
+        # get the context arguments
+        scene = context.scene
+        region = context.region
+        rv3d = context.region_data
+        coord = event.mouse_region_x, event.mouse_region_y
+        obj = context.object
+        self.pos = [coord[0], coord[1]]
+        
+        # get the ray from the viewport and mouse
+        view_vector = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+    
+        if rv3d.view_perspective == 'ORTHO':
+            # move ortho origin back
+            ray_origin = ray_origin - (view_vector * (ray_max / 2.0))
+    
+        ray_target = ray_origin + (view_vector * ray_max)
+        
+        def obj_ray_cast(obj, matrix):
+            """Wrapper for ray casting that moves the ray into object space"""
+    
+            # get the ray relative to the object
+            matrix_inv = matrix.inverted()
+            ray_origin_obj = matrix_inv * ray_origin
+            ray_target_obj = matrix_inv * ray_target
+    
+            # cast the ray
+            hit, normal, face_index = obj.ray_cast(ray_origin_obj, ray_target_obj)
+    
+            if face_index != -1:
+                return hit, normal, face_index
+            else:
+                return None, None, None
+            
+        hit, normal, face_index = obj_ray_cast(obj, obj.matrix_world)
+        if hit is not None:
+            phis = [v[self.phi_id] for v in self.bme.faces[face_index].verts]
+            
+            self.msg = str(sum(phis)/len(phis))[0:4]
+        else:
+            self.msg = "Hover the Object"
+            
+        
+    def invoke(self, context, event):
+        if context.space_data.type == 'VIEW_3D':
+            context.window_manager.modal_handler_add(self)
+            self._handle = bpy.types.SpaceView3D.draw_handler_add(self.draw_callback_px, (context,), 'WINDOW', 'POST_PIXEL')
+            
+            
+            self.bme = bmesh.new()
+            self.bme.from_mesh(context.object.data)
+            self.bme.verts.ensure_lookup_table()
+            self.bme.edges.ensure_lookup_table()
+            self.bme.faces.ensure_lookup_table()
+            self.msg = 'Hover The Object'
+            self.obj = context.object
+            self.pos = [event.mouse_region_x, event.mouse_region_y]
+            self.iso_val = 0
+            
+            self.iso_factor = 0.5
+            self.iso_pt = None  #index of a starting face
+            self.current_face = None
+            self.last_edge = None
+            
+            if 'phi' in self.bme.verts.layers.float:
+                self.phi_id = self.bme.verts.layers.float['phi']
+            else:
+                return {'CANCELLED'}
+            
+            return {'RUNNING_MODAL'}
+        else:
+            self.report({'WARNING'}, "Active space must be a View3d")
+            return {'CANCELLED'}
 def register():
     bpy.utils.register_class(ViewOperatorObjectCurve)
     bpy.utils.register_class(ViewObjectSalience)
     bpy.utils.register_class(WatershedObjectCurvature)
-    
+    bpy.utils.register_class(HarmonicOperator)
+    bpy.utils.register_class(HarmonicInspector)
 def unregister():
     bpy.utils.unregister_class(ViewOperatorObjectCurve)
     bpy.utils.unregister_class(ViewObjectSalience)
     bpy.utils.unregister_class(WatershedObjectCurvature)
-    
+    bpy.utils.unregister_class(HarmonicOperator)
+    bpy.utils.unregister_class(HarmonicInspector)
 
 if __name__ == "__main__":
     register()
