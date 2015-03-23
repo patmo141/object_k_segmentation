@@ -1852,7 +1852,7 @@ class HarmonicIsolineWalker(bpy.types.Operator):
                 vals = [ed.verts[0][self.phi_id], ed.verts[1][self.phi_id]]
             
                 if min(vals) <= self.iso_val and max(vals) > self.iso_val:
-                    faces = [f.index for f in ed.link_faces if f.index != self.current_face.index and f.index != self.iso_pt]
+                    faces = [f for f in ed.link_faces if f.index != self.current_face.index and f.index != self.iso_pt]
                     
                     if len(faces):
                         self.current_face = faces[0]
@@ -1861,14 +1861,14 @@ class HarmonicIsolineWalker(bpy.types.Operator):
                         v_diff = ed.verts[1].co - ed.verts[0].co 
                         a = (self.iso_val - ed.verts[0][self.phi_id])/(ed.verts[1][self.phi_id] - ed.verts[0][self.phi_id])
                 
-                        co = ed.verts[0] + a * v_diff
+                        co = ed.verts[0].co + a * v_diff
                 
                         return co
         return None
     
     def find_loops(self):
         
-        if not self.current_face:
+        if not self.iso_pt:
             self.msg = 'Click a Face'
             return
         
@@ -1884,33 +1884,39 @@ class HarmonicIsolineWalker(bpy.types.Operator):
             e_vals = [ed.verts[0][self.phi_id], ed.verts[1][self.phi_id]]
             if min(e_vals) < self.iso_val and max(e_vals) > self.iso_val:
                 good_eds.append(ed)
-                good_fs.apped([f for f in ed.link_faces if f.index != self.current_face.index][0])
+                good_fs.append([f for f in ed.link_faces if f.index != self.current_face.index][0])
         
-        print('there are %i good fs' % len(good_fs))
-        print('there are %i good eds' % len(good_eds)) 
+        #print('there are %i good fs' % len(good_fs))
+        #print('there are %i good eds' % len(good_eds)) 
         
         if len(good_eds) != 2 and len(good_eds) != len(good_fs):
             print('problem')
             return
         
         verts = []
-        max_iters = 1000
+        max_iters = 15000
+        i = 0
         for ed, f in zip(good_eds, good_fs):
             v_diff = ed.verts[1].co - ed.verts[0].co 
-            a = (self.iso_val - ed.verts[0][self.phi_id])/(ed.verts[1][self.phi_id] - sed.verts[0][self.phi_id])  
-            new_co = ed.verts[0] + a * v_diff
+            a = (self.iso_val - ed.verts[0][self.phi_id])/(ed.verts[1][self.phi_id] - ed.verts[0][self.phi_id])  
+            new_co = ed.verts[0].co + a * v_diff
             vert_list = [new_co]
             self.current_face = f
             self.last_edge = ed
             iters = 0
             while new_co and iters < max_iters:
                 new_co = self.walk_face()
-                vert_list.append(new_co)
+                if new_co:
+                    vert_list.append(new_co)
                 iters += 1
                 
-            verts.append(vert_list)
+            if len(vert_list):
+                if i == 0:
+                    verts.extend(vert_list)
+                if i == 1:
+                    verts.extend(vert_list.reverse())
                 
-        self.isoline = verts[0] + verts[1].reverse()
+        self.isoline = verts
                 
     def modal(self, context, event):
         context.area.tag_redraw()
@@ -1920,7 +1926,7 @@ class HarmonicIsolineWalker(bpy.types.Operator):
             return {'PASS_THROUGH'}
         
         elif event.type == 'LEFTMOUSE':
-            self.set_iso_seed()
+            self.pick_face(context, event)
             
             return {'RUNNING_MODAL'}
         
@@ -1931,20 +1937,17 @@ class HarmonicIsolineWalker(bpy.types.Operator):
             
             return {'RUNNING_MODAL'}
         
-        elif event.type == 'UP_ARROW':
-            
+        elif event.type == 'UP_ARROW' and event.value == 'PRESS':
             vals = [v[self.phi_id] for v in self.bme.faces[self.iso_pt].verts]
             max_i = max(vals)
             min_i = min(vals)
-            
             self.iso_val += (max_i - min_i)/10
-            
             if self.iso_val > max_i:
                 self.iso_val = max_i
             
             return {'RUNNING_MODAL'}    
-        elif event.type == 'DN_ARROW':
-            
+        
+        elif event.type == 'DOWN_ARROW' and event.value == 'PRESS':
             vals = [v[self.phi_id] for v in self.bme.faces[self.iso_pt].verts]
             max_i = max(vals)
             min_i = min(vals)
@@ -2009,10 +2012,17 @@ class HarmonicIsolineWalker(bpy.types.Operator):
         hit, normal, face_index = obj_ray_cast(obj, obj.matrix_world)
         if hit is not None:
             phis = [v[self.phi_id] for v in self.bme.faces[face_index].verts]
+            self.msg = str(sum(phis)/len(phis))[0:5]
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                self.iso_pt = face_index
+                self.iso_val = sum(phis)/len(phis)
             
-            self.msg = str(sum(phis)/len(phis))[0:4]
         else:
             self.msg = "Hover the Object"
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                self.iso_pt = None
+                self.iso_val = None
+            
             
         
     def invoke(self, context, event):
@@ -2030,6 +2040,7 @@ class HarmonicIsolineWalker(bpy.types.Operator):
             self.obj = context.object
             self.pos = [event.mouse_region_x, event.mouse_region_y]
             self.iso_val = 0
+            self.isoline = []
             
             self.iso_factor = 0.5
             self.iso_pt = None  #index of a starting face
@@ -2051,13 +2062,14 @@ def register():
     bpy.utils.register_class(WatershedObjectCurvature)
     bpy.utils.register_class(HarmonicOperator)
     bpy.utils.register_class(HarmonicInspector)
+    bpy.utils.register_class(HarmonicIsolineWalker)
 def unregister():
     bpy.utils.unregister_class(ViewOperatorObjectCurve)
     bpy.utils.unregister_class(ViewObjectSalience)
     bpy.utils.unregister_class(WatershedObjectCurvature)
     bpy.utils.unregister_class(HarmonicOperator)
     bpy.utils.unregister_class(HarmonicInspector)
-
+    bpy.utils.unregister_class(HarmonicIsolineWalker)
 if __name__ == "__main__":
     register()
 
