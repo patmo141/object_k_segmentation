@@ -33,7 +33,7 @@ from bpy_extras import view3d_utils
 from bpy.props import BoolProperty, FloatProperty, IntProperty
 from bpy_extras.view3d_utils import location_3d_to_region_2d, region_2d_to_vector_3d, region_2d_to_location_3d, region_2d_to_origin_3d
 
-from retopoflow.polystrips_utilities import cubic_bezier_fit_points, cubic_bezier_blend_t
+#from retopoflow.polystrips_utilities import cubic_bezier_fit_points, cubic_bezier_blend_t
 
 def vector_average(l_vecs):
     v_mean = Vector((0,0,0))
@@ -1184,6 +1184,10 @@ class WatershedObjectCurvature(bpy.types.Operator):
         let j's be arbitrary list comprehension indices
         let n's be the incidices in our consensus point lists range 0,len(consensus_list)
         '''
+        
+        pass
+    
+        '''
         l_co = self.clipped_verts
         
         
@@ -1250,7 +1254,7 @@ class WatershedObjectCurvature(bpy.types.Operator):
             new_pts = [cubic_bezier_blend_t(p0,p1,p2,p3,i/N) for i in range(0,N)]
             
             self.bez_curve.extend(new_pts)  
-             
+    '''         
     def invoke(self,context, event):
         ob = bpy.context.object
         self.bme = bmesh.new()
@@ -1452,7 +1456,7 @@ class HarmonicOperator(bpy.types.Operator):
     
     recalc_wij = BoolProperty(
             name="recalc wij",
-            description = "Recalc Concavity, important if you have sculpted or changed mesh",
+            description = "Recalc Wij, important if you have sculpted or changed mesh",
             default=False,
             )
     
@@ -1608,7 +1612,7 @@ class HarmonicOperator(bpy.types.Operator):
         verts0.intersection_update(v_inds)
         verts1.intersection_update(v_inds)
         verts5.intersection_update(v_inds)
-        S = list(verts0) + list(verts1) + list(verts5)
+        S = list(verts0) + list(verts1) + list(verts5)  #these are indices in teh bmesh
         n = len(S)
         
         Vals = np.zeros(m + 2*m_ed + n)
@@ -1621,7 +1625,7 @@ class HarmonicOperator(bpy.types.Operator):
         
         for i,v_ind in enumerate(v_inds):
             v_map_to_bm[i] = v_ind  #when we actually solve, we gotta put that on the mesh!
-            v_map_fr_bm[v_ind] = i  #these are redundant right now, because we are using all verts
+            v_map_fr_bm[v_ind] = i  #these are redundant right now, because we are using all verts, but if we want to limit to a subset of verts later
             
             Vals[i] = sum([ed[wij_id] for ed in bme.verts[v_ind].link_edges])
             Is[i] = i
@@ -1655,8 +1659,6 @@ class HarmonicOperator(bpy.types.Operator):
             Js[m + 2*m_ed + j] =   v_map_fr_bm[i]
             
             
-        
-        
         A = sparse.coo_matrix((Vals,(Is,Js)),shape=(m + n, m))
         A.tocsr()
         
@@ -1668,16 +1670,63 @@ class HarmonicOperator(bpy.types.Operator):
         elif self.method == 0:
             phi = linalg.lsmr(A,b, damp = self.damping, atol = 1e-11, btol = 1e-11, maxiter = self.max_iters)
             method = 'SciPy Sparse lsmr'
+        
+        elif self.method == 2:
+            #use a difference value to solve initial conditino
+            #http://docs.scipy.org/doc/scipy-0.15.1/reference/generated/scipy.sparse.linalg.lsqr.html
+            
+            '''
+            If some initial estimate x0 is known and if damp == 0, one could proceed as follows:
+
+            Compute a residual vector r0 = b - A*x0.
+            Use LSQR to solve the system A*dx = r0.
+            Add the correction dx to obtain a final solution x = x0 + dx.
+            '''
+            
+            print('solving with initial conditions')
+            phi0 = np.zeros(m)
+                
+            for j, i in enumerate(v_inds):
+                if i in verts0:
+                    phi0[j] = 0  #may need to do a -1 index 
+                
+                elif i in verts1:
+                    phi0[j] =  w
+                
+                elif i in verts5:
+                    phi0[j] =  0.5 * w  #initialze all with .5 value
+            
+            r0 = b - A * phi0
+            dphi = linalg.lsqr(A,r0, damp = self.damping, atol = 1e-11, btol = 1e-11, iter_lim = self.max_iters)
+            #dphi = linalg.lsmr(A,r0, damp = self.damping, atol = 1e-11, btol = 1e-11, maxiter = self.max_iters)
+            
+            phi = [None, None, None]
+            phi[0]= phi0 + dphi[0]
+            phi[1] = dphi[1]
+            phi[2] = dphi[2]
+            
+            
+            method = 'SciPy Sparse lsmr'
+            
+            
         elif self.method == 1:
             phi = linalg.lsqr(A,b, damp = self.damping, atol = 1e-11, btol = 1e-11, iter_lim = self.max_iters)
-            method = 'SciPy Sparse lswr'    
+            method = 'SciPy Sparse lsqr'    
         
         duration = time.time() - start
         print('took %f seconds to solve with %s' % (duration, method))
         print('took %i iterations' % phi[2])
         
+        print('some dimensions A, b, phi and len verts')
+        print(A.shape)
+        print(b.shape)
+        print(phi[0].shape)
+        print(len(bme.verts))
+        print(m)
+        
         for i, elem in enumerate(phi[0]):
             bme.verts[v_map_to_bm[i]][phi_id] = elem
+            #bmesh.verts[index given in the ver mapping][data layer id] = [phi value] 
         
         
 
